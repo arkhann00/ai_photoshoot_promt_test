@@ -92,7 +92,7 @@ async def handle_photo(message: Message, bot: Bot) -> None:
 
     await waiting_msg.delete()
     await message.answer_photo(result_file, caption="Готово!")
-
+    await message.answer_document(result_file)
 
 @dp.message()
 async def handle_just_text(message: Message) -> None:

@@ -55,30 +55,37 @@ def _build_prompt(style_title: str, style_prompt: Optional[str]) -> str:
 async def generate_photoshoot_image(
     style_title: str,
     style_prompt: Optional[str],
-    user_photo_file_ids: Sequence[str] | str,
-    bot: Bot,
+    user_photo_file_ids: Sequence[str] | str | None = None,
+    bot: Bot | None = None,
+    # ✅ поддержка старого имени аргумента, чтобы не падало в других местах кода
+    user_photo_file_id: str | None = None,
 ) -> FSInputFile:
     """
     Основная функция генерации фотосессии через CometAI.
 
     Поддерживает 1, 2 или 3 входных фото из Telegram.
 
-    1. Скачиваем 1–3 фото из Telegram.
-    2. Кодируем каждое в Base64.
-    3. Отправляем один запрос в CometAI (gemini-3-pro-image) с несколькими inline_data.
-    4. Достаём Base64-картинку из ответа.
-    5. Сохраняем изображение во временный файл и возвращаем FSInputFile.
+    Принимает:
+      - user_photo_file_ids: Sequence[str] | str
+      - user_photo_file_id: str (алиас для обратной совместимости)
     """
+
+    if bot is None:
+        raise RuntimeError("Не передан bot в generate_photoshoot_image(...)")
 
     api_key = settings.COMET_API_KEY
     if not api_key:
         raise RuntimeError("COMET_API_KEY не задан в конфиге (settings.COMET_API_KEY).")
 
+    # ✅ если передали старый аргумент — конвертим в новый
+    if user_photo_file_ids is None and user_photo_file_id:
+        user_photo_file_ids = user_photo_file_id
+
     # Приводим параметр к списку file_id
     if isinstance(user_photo_file_ids, str):
         file_ids_list = [user_photo_file_ids]
     else:
-        file_ids_list = list(user_photo_file_ids)
+        file_ids_list = list(user_photo_file_ids or [])
 
     if not file_ids_list:
         raise RuntimeError("Не передано ни одного фото для генерации фотосессии.")
@@ -104,10 +111,7 @@ async def generate_photoshoot_image(
     prompt_text = _build_prompt(style_title=style_title, style_prompt=style_prompt)
 
     # Формируем parts: сначала текст, затем 1–3 inline_data
-    parts: list[dict] = [
-        {"text": prompt_text},
-    ]
-
+    parts: list[dict] = [{"text": prompt_text}]
     for image_b64 in image_b64_list:
         parts.append(
             {
@@ -119,31 +123,23 @@ async def generate_photoshoot_image(
         )
 
     payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": parts,
-            }
-        ],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
-            "responseModalities": [
-                "IMAGE",
-            ]
+            "responseModalities": ["IMAGE"],
         },
     }
 
     headers = {
-        # В доке CometAI: Authorization: sk-xxxx
         "Authorization": api_key,
         "Content-Type": "application/json",
         "Accept": "*/*",
     }
 
-    # SSL-контекст с актуальными корневыми сертификатами
     ssl_context = ssl.create_default_context(cafile=certifi.where())
     connector = aiohttp.TCPConnector(ssl=ssl_context)
 
     # 3. Запрос к CometAI
+    data = None
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.post(
@@ -153,40 +149,26 @@ async def generate_photoshoot_image(
                 timeout=120,
             ) as resp:
                 resp_text = await resp.text()
-
-                # Пробуем распарсить JSON (может не получиться, оставим как есть)
-                data = None
                 try:
                     data = await resp.json()
                 except Exception:
                     data = None
 
                 if resp.status != 200:
-                    # Пытаемся вытащить код/сообщение ошибки
                     error_code = None
-                    error_message = None
                     if isinstance(data, dict):
                         err = data.get("error") or {}
                         error_code = err.get("code")
-                        error_message = err.get("message")
 
-                    logger.error(
-                        "CometAI вернул ошибку: status=%s, body=%s",
-                        resp.status,
-                        resp_text,
-                    )
+                    logger.error("CometAI вернул ошибку: status=%s, body=%s", resp.status, resp_text)
 
-                    # Отдельный кейс: закончилась квота
                     if resp.status == 403 and error_code == "insufficient_user_quota":
                         raise RuntimeError(
                             "На стороне сервиса генерации закончился оплаченный лимит. "
                             "Скоро всё починим — попробуй зайти позже 🙏"
                         )
 
-                    raise RuntimeError(
-                        "Сервис генерации фото сейчас недоступен. Попробуй позже."
-                    )
-
+                    raise RuntimeError("Сервис генерации фото сейчас недоступен. Попробуй позже.")
     except Exception as e:
         logger.exception("Ошибка при запросе к CometAI: %s", e)
         raise RuntimeError(str(e)) from e
@@ -196,11 +178,14 @@ async def generate_photoshoot_image(
     mime_type: str = "image/jpeg"
 
     try:
+        if not isinstance(data, dict):
+            raise RuntimeError("Ответ сервиса не в формате JSON")
+
         candidates = data.get("candidates") or []
         if not candidates:
             raise RuntimeError("Сервис не вернул кандидатов изображения")
 
-        parts_response = candidates[0].get("content", {}).get("parts", [])
+        parts_response = candidates[0].get("content", {}).get("parts", []) or []
 
         for part in parts_response:
             inline_data = part.get("inlineData") or part.get("inline_data")
@@ -226,19 +211,13 @@ async def generate_photoshoot_image(
     try:
         tmp_dir = tempfile.gettempdir()
         ext = ".jpg"
-
         if "png" in mime_type:
             ext = ".png"
         elif "webp" in mime_type:
             ext = ".webp"
 
-        # Берём первый file_id для имени файла, чтобы было стабильно
         file_id_for_name = file_ids_list[0]
-
-        file_path = os.path.join(
-            tmp_dir,
-            f"photoshoot_{file_id_for_name}{ext}",
-        )
+        file_path = os.path.join(tmp_dir, f"photoshoot_{file_id_for_name}{ext}")
 
         with open(file_path, "wb") as f:
             f.write(image_bytes)

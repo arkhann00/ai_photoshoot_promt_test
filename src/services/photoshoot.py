@@ -275,7 +275,7 @@ async def generate_photoshoot_image(
                 endpoint,
                 json=payload,
                 headers=headers,
-                timeout=180,
+                timeout=300,
             ) as resp:
                 resp_text = await resp.text()
                 try:

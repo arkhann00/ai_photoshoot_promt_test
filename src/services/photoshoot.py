@@ -6,7 +6,7 @@ import os
 import re
 import ssl
 import tempfile
-from typing import Optional, List
+from typing import Optional, List, Sequence, Union
 
 import aiohttp
 import certifi
@@ -60,6 +60,52 @@ def _split_file_ids(user_photo_file_id: str) -> List[str]:
     return parts
 
 
+def _normalize_input_file_ids(
+    user_photo_file_id: Optional[str],
+    user_photo_file_ids: Optional[Union[Sequence[str], str]],
+) -> List[str]:
+    """
+    Приводит вход к списку file_id, поддерживает:
+    - user_photo_file_id: str (один или "id1 id2")
+    - user_photo_file_ids: list[str] / tuple[str] / str
+    """
+    out: List[str] = []
+
+    # 1) старый параметр (строка с разделителями)
+    if user_photo_file_id:
+        out.extend(_split_file_ids(user_photo_file_id))
+
+    # 2) новый параметр (список или строка)
+    if user_photo_file_ids:
+        if isinstance(user_photo_file_ids, str):
+            out.extend(_split_file_ids(user_photo_file_ids))
+        else:
+            for x in user_photo_file_ids:
+                if x and str(x).strip():
+                    out.append(str(x).strip())
+
+    # дедуп, сохраняя порядок
+    seen = set()
+    uniq: List[str] = []
+    for fid in out:
+        if fid in seen:
+            continue
+        seen.add(fid)
+        uniq.append(fid)
+
+    return uniq
+
+
+def _safe_slug(value: str, max_len: int = 80) -> str:
+    """
+    Безопасный кусок для имени файла (temp).
+    """
+    s = re.sub(r"[^0-9A-Za-z_-]+", "_", value).strip("_")
+    if not s:
+        s = "img"
+    return s[:max_len]
+
+
 async def _download_telegram_photo(bot: Bot, file_id: str) -> bytes:
     """
     Скачивает фото из Telegram по file_id и возвращает байты.
@@ -95,26 +141,31 @@ def _build_prompt(style_title: str, style_prompt: Optional[str]) -> str:
 
 async def generate_photoshoot_image(
     style_title: str,
-    style_prompt: Optional[str],
-    user_photo_file_id: str,
-    bot: Bot,
+    style_prompt: Optional[str] = None,
+    user_photo_file_id: Optional[str] = None,
+    bot: Optional[Bot] = None,
+    user_photo_file_ids: Optional[Union[Sequence[str], str]] = None,
 ) -> FSInputFile:
     """
     Генерация фотосессии через APIYI (Google-формат generateContent).
 
-    Поддержка 1..3 входных фото:
-    - user_photo_file_id может содержать 1 file_id или несколько, разделённых пробелом/запятой/переносом строки.
+    Совместимость по входу:
+    - Можно передавать ОДНО фото через user_photo_file_id="id"
+    - Можно передавать 1..3 фото через user_photo_file_id="id1 id2"
+    - Можно передавать список 1..3 фото через user_photo_file_ids=[id1, id2, id3]
+    - Можно передавать строку через user_photo_file_ids="id1,id2"
 
-    Запрашиваем 4K в ответ.
+    Запрашиваем 4K в ответ (если модель/тариф поддерживают).
     """
+
+    if bot is None:
+        raise RuntimeError("Параметр bot не передан в generate_photoshoot_image().")
 
     # Совместимость: ключ можно хранить в COMET_API_KEY (как раньше),
     # либо завести отдельный APIYI_API_KEY.
     api_key = getattr(settings, "APIYI_API_KEY", None) or getattr(settings, "COMET_API_KEY", None)
     if not api_key:
-        raise RuntimeError(
-            "API ключ не задан. Укажи settings.APIYI_API_KEY или settings.COMET_API_KEY."
-        )
+        raise RuntimeError("API ключ не задан. Укажи settings.APIYI_API_KEY или settings.COMET_API_KEY.")
 
     model_name = getattr(settings, "APIYI_MODEL_NAME", None) or APIYI_MODEL_NAME_DEFAULT
     endpoint = f"{APIYI_BASE_URL}/v1beta/models/{model_name}:generateContent"
@@ -122,9 +173,9 @@ async def generate_photoshoot_image(
     timeout_seconds = int(getattr(settings, "APIYI_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS))
 
     # 0) Разбираем вход: 1..3 file_id
-    file_ids = _split_file_ids(user_photo_file_id)
+    file_ids = _normalize_input_file_ids(user_photo_file_id=user_photo_file_id, user_photo_file_ids=user_photo_file_ids)
     if not file_ids:
-        raise RuntimeError("Не передан file_id фото пользователя.")
+        raise RuntimeError("Не передан file_id фото пользователя (user_photo_file_id/user_photo_file_ids).")
     if len(file_ids) > MAX_INPUT_PHOTOS:
         file_ids = file_ids[:MAX_INPUT_PHOTOS]
 
@@ -210,11 +261,10 @@ async def generate_photoshoot_image(
                         resp_text,
                     )
 
-                    # Частый кейс: 4K не поддержан моделью/планом или неверные параметры imageSize
                     if error_message and ("imageSize" in error_message or "4K" in error_message):
                         raise RuntimeError(
                             "Сервис отклонил запрос 4K (imageSize=4K). "
-                            "Проверь модель/тариф или попробуй другую модель, которая поддерживает 4K."
+                            "Проверь модель/тариф или попробуй модель, которая поддерживает 4K."
                         )
 
                     if resp.status in (401, 403):
@@ -278,9 +328,12 @@ async def generate_photoshoot_image(
         elif "webp" in mime_type_out:
             ext = ".webp"
 
-        # Чтобы не перезаписывать один и тот же файл при нескольких фотках:
+        # безопасное имя
+        joined_ids = "_".join(file_ids)
+        slug = _safe_slug(joined_ids)
+
         suffix = f"{len(file_ids)}p"
-        file_path = os.path.join(tmp_dir, f"photoshoot_{user_photo_file_id}_{suffix}{ext}")
+        file_path = os.path.join(tmp_dir, f"photoshoot_{slug}_{suffix}{ext}")
 
         with open(file_path, "wb") as f:
             f.write(image_bytes)

@@ -26,12 +26,12 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column
 
 from src.data.star_offers import StarOffer
-
+from config import settings
 SUPER_ADMIN_ID = 707366569
-DATABASE_URL = "sqlite+aiosqlite:///./bot.db"
+# DATABASE_URL = "sqlite+aiosqlite:///./bot.db"
 
 engine = create_async_engine(
-    DATABASE_URL,
+    settings.DATABASE_URL,
     echo=False,
     future=True,
 )

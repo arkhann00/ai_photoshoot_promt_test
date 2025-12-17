@@ -28,7 +28,6 @@ from sqlalchemy.orm import declarative_base, Mapped, mapped_column
 from src.data.star_offers import StarOffer
 from config import settings
 SUPER_ADMIN_ID = 707366569
-# DATABASE_URL = "sqlite+aiosqlite:///./bot.db"
 
 engine = create_async_engine(
     settings.DATABASE_URL,
